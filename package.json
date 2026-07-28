@@ -56,5 +56,12 @@
     "prettier": "^3.8.4",
     "ts-jest": "^29.4.11",
     "typescript": "^6.0.3"
+  },
+  "overrides": {
+    "@actions/cache": {
+      "@actions/glob": "0.7.0"
+    },
+    "minimatch": "10.2.6",
+    "brace-expansion": "5.0.8"
   }
 }
