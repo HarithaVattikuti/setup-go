@@ -12887,7 +12887,13 @@ function processHeader (request, key, val) {
       } else if (typeof val[i] === 'object') {
         throw new InvalidArgumentError(`invalid ${key} header`)
       } else {
-        arr.push(`${val[i]}`)
+        // Coerce primitives (and reject unsafe coercions such as functions
+        // with a crafted toString/Symbol.toPrimitive).
+        const str = `${val[i]}`
+        if (!isValidHeaderValue(str)) {
+          throw new InvalidArgumentError(`invalid ${key} header`)
+        }
+        arr.push(str)
       }
     }
     val = arr
@@ -12898,7 +12904,12 @@ function processHeader (request, key, val) {
   } else if (val === null) {
     val = ''
   } else {
+    // Coerce primitives (and reject unsafe coercions such as functions
+    // with a crafted toString/Symbol.toPrimitive).
     val = `${val}`
+    if (!isValidHeaderValue(val)) {
+      throw new InvalidArgumentError(`invalid ${key} header`)
+    }
   }
 
   if (headerName === 'host') {
@@ -14270,6 +14281,7 @@ const {
   RequestContentLengthMismatchError,
   ResponseContentLengthMismatchError,
   RequestAbortedError,
+  InvalidArgumentError,
   HeadersTimeoutError,
   HeadersOverflowError,
   SocketError,
@@ -15253,8 +15265,16 @@ function writeH1 (client, request) {
     }
     body = bodyStream.stream
     contentLength = bodyStream.length
-  } else if (util.isBlobLike(body) && request.contentType == null && body.type) {
-    headers.push('content-type', body.type)
+  } else if (util.isBlobLike(body) && request.contentType == null) {
+    const contentType = body.type
+    if (contentType) {
+      const contentTypeValue = `${contentType}`
+      if (!util.isValidHeaderValue(contentTypeValue)) {
+        util.errorRequest(client, request, new InvalidArgumentError('invalid content-type header'))
+        return false
+      }
+      headers.push('content-type', contentTypeValue)
+    }
   }
 
   if (body && typeof body.read === 'function') {
@@ -18727,6 +18747,28 @@ function calculateRetryAfterHeader (retryAfter) {
   return new Date(retryAfter).getTime() - current
 }
 
+function validatePartialResponseContentLength (headers, range, statusCode, retryCount) {
+  const contentLength = headers['content-length']
+  if (contentLength == null) {
+    return null
+  }
+
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
+    return null
+  }
+
+  const length = Number(contentLength)
+  const expectedLength = range.end - range.start + 1
+  if (!Number.isFinite(length) || length !== expectedLength) {
+    return new RequestRetryError('Content-Length mismatch', statusCode, {
+      headers,
+      data: { count: retryCount }
+    })
+  }
+
+  return null
+}
+
 class RetryHandler {
   constructor (opts, handlers) {
     const { retryOptions, ...dispatchOpts } = opts
@@ -18941,6 +18983,12 @@ class RetryHandler {
         return false
       }
 
+      const contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount)
+      if (contentLengthError != null) {
+        this.abort(contentLengthError)
+        return false
+      }
+
       const { start, size, end = size - 1 } = contentRange
 
       assert(this.start === start, 'content-range mismatch')
@@ -18962,6 +19010,12 @@ class RetryHandler {
             resume,
             statusMessage
           )
+        }
+
+        const contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount)
+        if (contentLengthError != null) {
+          this.abort(contentLengthError)
+          return false
         }
 
         const { start, size, end = size - 1 } = range
@@ -23208,7 +23262,7 @@ function validateCookiePath (path) {
 
     if (
       code < 0x20 || // exclude CTLs (0-31)
-      code === 0x7F || // DEL
+      code > 0x7E || // exclude DEL and non-ascii
       code === 0x3B // ;
     ) {
       throw new Error('Invalid cookie path')
@@ -23217,16 +23271,80 @@ function validateCookiePath (path) {
 }
 
 /**
- * I have no idea why these values aren't allowed to be honest,
- * but Deno tests these. - Khafra
+ * <let-dig> ::= <letter> | <digit>
+ *
+ * <letter> ::= any one of the 52 alphabetic characters A through Z in
+ * upper case and a through z in lower case
+ *
+ * <digit> ::= any one of the ten digits 0 through 9r
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @param {number} code
+ */
+function isLetterOrDigit (code) {
+  return (
+    (code >= 0x30 && code <= 0x39) || // 0-9
+    (code >= 0x41 && code <= 0x5A) || // A-Z
+    (code >= 0x61 && code <= 0x7A) // a-z
+  )
+}
+
+/**
+ * Validates a cookie domain against the "preferred name syntax".
+ *
+ * <domain>      ::= <subdomain> | " "
+ * <subdomain>   ::= <label> | <subdomain> "." <label>
+ * <label>       ::= <let-dig> [ [ <ldh-str> ] <let-dig> ]
+ * <ldh-str>     ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+ * <let-dig-hyp> ::= <let-dig> | "-"
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @see https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+ * @see https://www.rfc-editor.org/rfc/rfc1035#section-2.3.4
  * @param {string} domain
  */
 function validateCookieDomain (domain) {
-  if (
-    domain.startsWith('-') ||
-    domain.endsWith('.') ||
-    domain.endsWith('-')
-  ) {
+  // <domain> ::= <subdomain> | " "
+  if (domain === ' ') {
+    return
+  }
+
+  if (domain.length > 255) {
+    throw new Error('Invalid cookie domain')
+  }
+
+  let labelLength = 0
+
+  for (let i = 0; i < domain.length; ++i) {
+    const code = domain.charCodeAt(i)
+
+    if (code === 0x2E) {
+      if (labelLength === 0) {
+        throw new Error('Invalid cookie domain')
+      }
+
+      if (domain.charCodeAt(i - 1) === 0x2D) { // "-"
+        throw new Error('Invalid cookie domain')
+      }
+
+      labelLength = 0
+      continue
+    }
+
+    if (labelLength === 0 && !isLetterOrDigit(code)) {
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (!isLetterOrDigit(code) && code !== 0x2D) { // "-"
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (++labelLength > 63) {
+      throw new Error('Invalid cookie domain')
+    }
+  }
+
+  if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 0x2D) { // "-"
     throw new Error('Invalid cookie domain')
   }
 }
@@ -23369,7 +23487,13 @@ function stringify (cookie) {
 
     const [key, ...value] = part.split('=')
 
-    out.push(`${key.trim()}=${value.join('=')}`)
+    const trimmedKey = key.trim()
+    const joinedValue = value.join('=')
+
+    validateCookieName(trimmedKey)
+    validateCookieValue(joinedValue)
+
+    out.push(`${trimmedKey}=${joinedValue}`)
   }
 
   return out.join('; ')
@@ -37667,7 +37791,7 @@ exports.w = {
 
 /***/ }),
 
-/***/ 8914:
+/***/ 9437:
 /***/ ((__unused_webpack_module, exports) => {
 
 var __webpack_unused_export__;
@@ -37684,7 +37808,7 @@ exports.w = void 0;
 exports.w = {
     instrumenterImplementation: undefined,
 };
-//# sourceMappingURL=state-cjs.cjs.map
+//# sourceMappingURL=state-cjs.js.map
 
 /***/ }),
 
@@ -37823,10 +37947,6 @@ var __webpack_exports__ = {};
 __nccwpck_require__.d(__webpack_exports__, {
   e: () => (/* binding */ run)
 });
-
-// NAMESPACE OBJECT: ./node_modules/minimatch/dist/esm/index.js
-var minimatch_dist_esm_namespaceObject = {};
-__nccwpck_require__.r(minimatch_dist_esm_namespaceObject);
 
 // NAMESPACE OBJECT: ./node_modules/@azure/storage-blob/dist/esm/generated/src/models/mappers.js
 var mappers_namespaceObject = {};
@@ -40961,7 +41081,7 @@ function getIDToken(aud) {
  */
 
 //# sourceMappingURL=core.js.map
-;// CONCATENATED MODULE: ./node_modules/@actions/cache/node_modules/@actions/glob/lib/internal-glob-options-helper.js
+;// CONCATENATED MODULE: ./node_modules/@actions/glob/lib/internal-glob-options-helper.js
 
 /**
  * Returns a copy with defaults filled in.
@@ -40999,7 +41119,7 @@ function getOptions(copy) {
     return result;
 }
 //# sourceMappingURL=internal-glob-options-helper.js.map
-;// CONCATENATED MODULE: ./node_modules/@actions/cache/node_modules/@actions/glob/lib/internal-path-helper.js
+;// CONCATENATED MODULE: ./node_modules/@actions/glob/lib/internal-path-helper.js
 
 
 const internal_path_helper_IS_WINDOWS = process.platform === 'win32';
@@ -41167,7 +41287,7 @@ function safeTrimTrailingSeparator(p) {
     return p.substr(0, p.length - 1);
 }
 //# sourceMappingURL=internal-path-helper.js.map
-;// CONCATENATED MODULE: ./node_modules/@actions/cache/node_modules/@actions/glob/lib/internal-match-kind.js
+;// CONCATENATED MODULE: ./node_modules/@actions/glob/lib/internal-match-kind.js
 /**
  * Indicates whether a pattern matches a path
  */
@@ -41183,7 +41303,7 @@ var MatchKind;
     MatchKind[MatchKind["All"] = 3] = "All";
 })(MatchKind || (MatchKind = {}));
 //# sourceMappingURL=internal-match-kind.js.map
-;// CONCATENATED MODULE: ./node_modules/@actions/cache/node_modules/@actions/glob/lib/internal-pattern-helper.js
+;// CONCATENATED MODULE: ./node_modules/@actions/glob/lib/internal-pattern-helper.js
 
 
 const internal_pattern_helper_IS_WINDOWS = process.platform === 'win32';
@@ -43745,7 +43865,7 @@ minimatch.Minimatch = Minimatch;
 minimatch.escape = escape_escape;
 minimatch.unescape = unescape_unescape;
 //# sourceMappingURL=index.js.map
-;// CONCATENATED MODULE: ./node_modules/@actions/cache/node_modules/@actions/glob/lib/internal-path.js
+;// CONCATENATED MODULE: ./node_modules/@actions/glob/lib/internal-path.js
 
 
 
@@ -43833,7 +43953,7 @@ class Path {
     }
 }
 //# sourceMappingURL=internal-path.js.map
-;// CONCATENATED MODULE: ./node_modules/@actions/cache/node_modules/@actions/glob/lib/internal-pattern.js
+;// CONCATENATED MODULE: ./node_modules/@actions/glob/lib/internal-pattern.js
 
 
 
@@ -43841,7 +43961,6 @@ class Path {
 
 
 
-const { Minimatch: internal_pattern_Minimatch } = minimatch_dist_esm_namespaceObject["default"];
 const internal_pattern_IS_WINDOWS = process.platform === 'win32';
 class Pattern {
     constructor(patternOrNegate, isImplicitPattern = false, segments, homedir) {
@@ -43898,7 +44017,7 @@ class Pattern {
             nonegate: true
         };
         pattern = internal_pattern_IS_WINDOWS ? pattern.replace(/\\/g, '/') : pattern;
-        this.minimatch = new internal_pattern_Minimatch(pattern, minimatchOptions);
+        this.minimatch = new Minimatch(pattern, minimatchOptions);
     }
     /**
      * Matches the pattern against the specified path
@@ -44063,7 +44182,7 @@ class Pattern {
     }
 }
 //# sourceMappingURL=internal-pattern.js.map
-;// CONCATENATED MODULE: ./node_modules/@actions/cache/node_modules/@actions/glob/lib/internal-search-state.js
+;// CONCATENATED MODULE: ./node_modules/@actions/glob/lib/internal-search-state.js
 class SearchState {
     constructor(path, level) {
         this.path = path;
@@ -44071,7 +44190,7 @@ class SearchState {
     }
 }
 //# sourceMappingURL=internal-search-state.js.map
-;// CONCATENATED MODULE: ./node_modules/@actions/cache/node_modules/@actions/glob/lib/internal-globber.js
+;// CONCATENATED MODULE: ./node_modules/@actions/glob/lib/internal-globber.js
 var internal_globber_awaiter = (undefined && undefined.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -44295,7 +44414,7 @@ class DefaultGlobber {
 const external_stream_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("stream");
 // EXTERNAL MODULE: external "util"
 var external_util_ = __nccwpck_require__(9023);
-;// CONCATENATED MODULE: ./node_modules/@actions/cache/node_modules/@actions/glob/lib/internal-hash-files.js
+;// CONCATENATED MODULE: ./node_modules/@actions/glob/lib/internal-hash-files.js
 var internal_hash_files_awaiter = (undefined && undefined.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -44372,7 +44491,7 @@ function hashFiles(globber_1, currentWorkspace_1) {
     });
 }
 //# sourceMappingURL=internal-hash-files.js.map
-;// CONCATENATED MODULE: ./node_modules/@actions/cache/node_modules/@actions/glob/lib/glob.js
+;// CONCATENATED MODULE: ./node_modules/@actions/glob/lib/glob.js
 var glob_awaiter = (undefined && undefined.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -45163,7 +45282,7 @@ function httpHeaders_createHttpHeaders(rawHeaders) {
  * @returns RFC4122 v4 UUID.
  */
 function randomUUID() {
-    return crypto.randomUUID();
+    return globalThis.crypto.randomUUID();
 }
 //# sourceMappingURL=uuidUtils.js.map
 ;// CONCATENATED MODULE: ./node_modules/@typespec/ts-http-runtime/dist/esm/pipelineRequest.js
@@ -46172,7 +46291,7 @@ function logPolicy_logPolicy(options = {}) {
             logger(`Request: ${sanitizer.sanitize(request)}`);
             const response = await next(request);
             logger(`Response status code: ${response.status}`);
-            logger(`Headers: ${sanitizer.sanitize(response.headers)}`);
+            logger(`Headers: ${sanitizer.sanitize({ headers: response.headers })}`);
             return response;
         },
     };
@@ -46277,7 +46396,7 @@ function userAgentPolicy_userAgentPolicy(options = {}) {
  * @param min - The smallest integer value allowed.
  * @param max - The largest integer value allowed.
  */
-function random_getRandomIntegerInclusive(min, max) {
+function getRandomIntegerInclusive(min, max) {
     // Make sure inputs are integers.
     min = Math.ceil(min);
     max = Math.floor(max);
@@ -46305,7 +46424,7 @@ function calculateRetryDelay(retryAttempt, config) {
     const clampedDelay = Math.min(config.maxRetryDelayInMs, exponentialDelay);
     // Allow the final value to have some "jitter" (within 50% of the delay size) so
     // that retries across multiple clients don't occur simultaneously.
-    const retryAfterInMs = clampedDelay / 2 + random_getRandomIntegerInclusive(0, clampedDelay / 2);
+    const retryAfterInMs = clampedDelay / 2 + getRandomIntegerInclusive(0, clampedDelay / 2);
     return { retryAfterInMs };
 }
 //# sourceMappingURL=delay.js.map
@@ -46510,7 +46629,7 @@ function isSystemError(err) {
 ;// CONCATENATED MODULE: ./node_modules/@typespec/ts-http-runtime/dist/esm/constants.js
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
-const constants_SDK_VERSION = "0.3.6";
+const constants_SDK_VERSION = "0.3.7";
 const constants_DEFAULT_RETRY_POLICY_COUNT = 3;
 //# sourceMappingURL=constants.js.map
 ;// CONCATENATED MODULE: ./node_modules/@typespec/ts-http-runtime/dist/esm/policies/retryPolicy.js
@@ -48301,7 +48420,7 @@ async function util_userAgentPlatform_setPlatformSpecificData(map) {
 ;// CONCATENATED MODULE: ./node_modules/@azure/core-rest-pipeline/dist/esm/constants.js
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
-const esm_constants_SDK_VERSION = "1.24.0";
+const esm_constants_SDK_VERSION = "1.25.0";
 const esm_constants_DEFAULT_RETRY_POLICY_COUNT = 3;
 //# sourceMappingURL=constants.js.map
 ;// CONCATENATED MODULE: ./node_modules/@azure/core-rest-pipeline/dist/esm/util/userAgent.js
@@ -48626,20 +48745,30 @@ async function computeSha256Hash(content, encoding) {
 //# sourceMappingURL=internal.js.map
 ;// CONCATENATED MODULE: ./node_modules/@azure/abort-controller/dist/esm/AbortError.js
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 /**
  * This error is thrown when an asynchronous operation has been aborted.
  * Check for this error by testing the `name` that the name property of the
  * error matches `"AbortError"`.
  *
  * @example
- * ```ts
+ * ```ts snippet:AbortErrorSample
+ * import { AbortError } from "@azure/abort-controller";
+ *
+ * async function doAsyncWork(options: { abortSignal: AbortSignal }): Promise<void> {
+ *   if (options.abortSignal.aborted) {
+ *     throw new AbortError();
+ *   }
+ *
+ *   // do async work
+ * }
+ *
  * const controller = new AbortController();
  * controller.abort();
  * try {
- *   doAsyncWork(controller.signal)
+ *   doAsyncWork({ abortSignal: controller.signal });
  * } catch (e) {
- *   if (e.name === 'AbortError') {
+ *   if (e instanceof Error && e.name === "AbortError") {
  *     // handle abort error here.
  *   }
  * }
@@ -48654,7 +48783,7 @@ class AbortError_AbortError extends Error {
 //# sourceMappingURL=AbortError.js.map
 ;// CONCATENATED MODULE: ./node_modules/@azure/abort-controller/dist/esm/index.js
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 
 //# sourceMappingURL=index.js.map
 ;// CONCATENATED MODULE: ./node_modules/@azure/core-util/dist/esm/createAbortablePromise.js
@@ -48704,7 +48833,6 @@ function createAbortablePromise(buildPromise, options) {
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-
 const delay_StandardAbortMessage = "The delay was aborted.";
 /**
  * A wrapper for setTimeout that resolves a promise after timeInMs milliseconds.
@@ -48722,22 +48850,6 @@ function delay_delay(timeInMs, options) {
         abortSignal,
         abortErrorMsg: abortErrorMsg ?? delay_StandardAbortMessage,
     });
-}
-/**
- * Calculates the delay interval for retry attempts using exponential delay with jitter.
- * @param retryAttempt - The current retry attempt number.
- * @param config - The exponential retry configuration.
- * @returns An object containing the calculated retry delay.
- */
-function delay_calculateRetryDelay(retryAttempt, config) {
-    // Exponentially increase the delay each time
-    const exponentialDelay = config.retryDelayInMs * Math.pow(2, retryAttempt);
-    // Don't let the delay exceed the maximum
-    const clampedDelay = Math.min(config.maxRetryDelayInMs, exponentialDelay);
-    // Allow the final value to have some "jitter" (within 50% of the delay size) so
-    // that retries across multiple clients don't occur simultaneously.
-    const retryAfterInMs = clampedDelay / 2 + getRandomIntegerInclusive(0, clampedDelay / 2);
-    return { retryAfterInMs };
 }
 //# sourceMappingURL=delay.js.map
 ;// CONCATENATED MODULE: ./node_modules/@azure/core-util/dist/esm/error.js
@@ -49036,8 +49148,8 @@ class TracingContextImpl {
     }
 }
 //# sourceMappingURL=tracingContext.js.map
-// EXTERNAL MODULE: ./node_modules/@azure/core-tracing/dist/commonjs/state.js
-var commonjs_state = __nccwpck_require__(8914);
+// EXTERNAL MODULE: ./node_modules/@azure/core-tracing/dist/commonjs/state-cjs.js
+var state_cjs = __nccwpck_require__(9437);
 ;// CONCATENATED MODULE: ./node_modules/@azure/core-tracing/dist/esm/state.js
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
@@ -49047,7 +49159,7 @@ var commonjs_state = __nccwpck_require__(8914);
 /**
  * Defines the shared state between CJS and ESM by re-exporting the CJS state.
  */
-const state_state = commonjs_state/* state */.w;
+const state_state = state_cjs/* state */.w;
 //# sourceMappingURL=state.js.map
 ;// CONCATENATED MODULE: ./node_modules/@azure/core-tracing/dist/esm/instrumenter.js
 // Copyright (c) Microsoft Corporation.
@@ -49129,8 +49241,8 @@ function createTracingClient(options) {
     function startSpan(name, operationOptions, spanOptions) {
         const startSpanResult = getInstrumenter().startSpan(name, {
             ...spanOptions,
-            packageName: packageName,
-            packageVersion: packageVersion,
+            packageName,
+            packageVersion,
             tracingContext: operationOptions?.tracingOptions?.tracingContext,
         });
         let tracingContext = startSpanResult.tracingContext;
@@ -49150,7 +49262,7 @@ function createTracingClient(options) {
     async function withSpan(name, operationOptions, callback, spanOptions) {
         const { span, updatedOptions } = startSpan(name, operationOptions, spanOptions);
         try {
-            const result = await withContext(updatedOptions.tracingOptions.tracingContext, () => Promise.resolve(callback(updatedOptions, span)));
+            const result = await withContext(updatedOptions.tracingOptions.tracingContext, () => callback(updatedOptions, span));
             span.setStatus({ status: "success" });
             return result;
         }
@@ -50228,22 +50340,6 @@ function isSASCredential(credential) {
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 /**
- * @internal
- * @param accessToken - Access token
- * @returns Whether a token is bearer type or not
- */
-function isBearerToken(accessToken) {
-    return !accessToken.tokenType || accessToken.tokenType === "Bearer";
-}
-/**
- * @internal
- * @param accessToken - Access token
- * @returns Whether a token is Pop token or not
- */
-function isPopToken(accessToken) {
-    return accessToken.tokenType === "pop";
-}
-/**
  * Tests an object to determine whether it implements TokenCredential.
  *
  * @param credential - The assumed TokenCredential to be tested.
@@ -50274,7 +50370,7 @@ const disableKeepAlivePolicyName = "DisableKeepAlivePolicy";
 function createDisableKeepAlivePolicy() {
     return {
         name: disableKeepAlivePolicyName,
-        async sendRequest(request, next) {
+        sendRequest(request, next) {
             request.disableKeepAlive = true;
             return next(request);
         },
@@ -51409,7 +51505,7 @@ const MapperTypeNames = {
 };
 //# sourceMappingURL=serializer.js.map
 // EXTERNAL MODULE: ./node_modules/@azure/core-client/dist/commonjs/state-cjs.js
-var state_cjs = __nccwpck_require__(30);
+var commonjs_state_cjs = __nccwpck_require__(30);
 ;// CONCATENATED MODULE: ./node_modules/@azure/core-client/dist/esm/state.js
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
@@ -51419,7 +51515,7 @@ var state_cjs = __nccwpck_require__(30);
 /**
  * Defines the shared state between CJS and ESM by re-exporting the CJS state.
  */
-const esm_state_state = state_cjs/* state */.w;
+const esm_state_state = commonjs_state_cjs/* state */.w;
 //# sourceMappingURL=state.js.map
 ;// CONCATENATED MODULE: ./node_modules/@azure/core-client/dist/esm/operationHelpers.js
 // Copyright (c) Microsoft Corporation.
@@ -52608,6 +52704,22 @@ const util_originalRequestSymbol = Symbol("Original PipelineRequest");
 // cloned but we need to retrieve the OperationSpec and OperationArguments from the
 // original request.
 const originalClientRequestSymbol = Symbol.for("@azure/core-client original request");
+const passThroughProps = new Set([
+    "url",
+    "method",
+    "withCredentials",
+    "timeout",
+    "requestId",
+    "abortSignal",
+    "body",
+    "formData",
+    "onDownloadProgress",
+    "onUploadProgress",
+    "proxySettings",
+    "streamResponseStatusCodes",
+    "agent",
+    "requestOverrides",
+]);
 function toPipelineRequest(webResource, options = {}) {
     const compatWebResource = webResource;
     const request = compatWebResource[util_originalRequestSymbol];
@@ -52691,23 +52803,7 @@ function toWebResourceLike(request, options) {
                 if (prop === "keepAlive") {
                     request.disableKeepAlive = !value;
                 }
-                const passThroughProps = [
-                    "url",
-                    "method",
-                    "withCredentials",
-                    "timeout",
-                    "requestId",
-                    "abortSignal",
-                    "body",
-                    "formData",
-                    "onDownloadProgress",
-                    "onUploadProgress",
-                    "proxySettings",
-                    "streamResponseStatusCodes",
-                    "agent",
-                    "requestOverrides",
-                ];
-                if (typeof prop === "string" && passThroughProps.includes(prop)) {
+                if (typeof prop === "string" && passThroughProps.has(prop)) {
                     request[prop] = value;
                 }
                 return Reflect.set(target, prop, value, receiver);
@@ -54094,8 +54190,36 @@ const buildRegexes = (startChar, char, flags = '') => {
 const regexes10 = buildRegexes(nameStartChar10, nameChar10);       // no /u — BMP only
 const regexes11 = buildRegexes(nameStartChar11, nameChar11, 'u');  // /u — enables \u{10000}-\u{EFFFF}
 
-const getRegexes = (xmlVersion = '1.0') =>
-  xmlVersion === '1.1' ? regexes11 : regexes10;
+// ---------------------------------------------------------------------------
+// ASCII-only fast path (opt-in, off by default)
+//
+// The XML 1.0 vs 1.1 NameStartChar/NameChar productions differ *only* in
+// their non-ASCII ranges (merged vs split Latin-1 ranges, \u0487, and
+// supplementary planes). Restricted to ASCII, both versions collapse to the
+// same character classes, so a single regex pair covers both xmlVersion
+// values — no /u flag needed.
+//
+// Rationale: unicode-aware regexes (the /u flag, required for XML 1.1's
+// supplementary-plane range) are measurably slower in V8 than plain
+// non-unicode regexes on the same input, even when the input is pure ASCII.
+// For the common case — HTML/SVG ids, XML tags — names are ASCII, so callers
+// who know this can opt in to skip the unicode-aware matching path entirely.
+// This is a real but *conditional* win: mainly for XML 1.1 input (avoids /u),
+// or at scale where the larger unicode character classes add engine
+// overhead. It also changes behaviour (rejects legitimate non-ASCII XML
+// 1.0/1.1 names), so it must never be silently enabled — hence off by
+// default.
+// ---------------------------------------------------------------------------
+
+const nameStartCharAscii = ':A-Za-z_';
+const nameCharAscii = nameStartCharAscii + '\\-\\.\\d';
+
+const regexesAscii = buildRegexes(nameStartCharAscii, nameCharAscii); // no /u — ASCII only
+
+const getRegexes = (xmlVersion = '1.0', asciiOnly = false) => {
+  if (asciiOnly) return regexesAscii;
+  return xmlVersion === '1.1' ? regexes11 : regexes10;
+};
 
 // ---------------------------------------------------------------------------
 // Boolean validators
@@ -54105,57 +54229,131 @@ const getRegexes = (xmlVersion = '1.0') =>
  * Returns true if the string is a valid XML Name.
  * Colons are allowed anywhere (Name production).
  * Used for: DOCTYPE entity names, notation names, DTD element declarations.
+ *
+ * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
+ *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
  */
-const src_name = (str, { xmlVersion = '1.0' } = {}) =>
-  getRegexes(xmlVersion).name.test(str);
+const src_name = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
+  getRegexes(xmlVersion, asciiOnly).name.test(str);
 
 /**
  * Returns true if the string is a valid NCName (Non-Colonized Name).
  * Colons are not permitted.
  * Used for: namespace prefixes, local names, SVG id attributes.
+ *
+ * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
+ *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
  */
-const ncName = (str, { xmlVersion = '1.0' } = {}) =>
-  getRegexes(xmlVersion).ncName.test(str);
+const ncName = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
+  getRegexes(xmlVersion, asciiOnly).ncName.test(str);
 
 /**
  * Returns true if the string is a valid QName (Qualified Name).
  * Allows exactly one colon as a prefix separator: prefix:localName.
  * Used for: element and attribute names in namespace-aware XML/SVG.
+ *
+ * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
+ *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
  */
-const qName = (str, { xmlVersion = '1.0' } = {}) =>
-  getRegexes(xmlVersion).qName.test(str);
+const qName = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
+  getRegexes(xmlVersion, asciiOnly).qName.test(str);
 
 /**
  * Returns true if the string is a valid NMToken.
  * Like Name but no restriction on the first character.
  * Used for: DTD NMTOKEN attribute values.
+ *
+ * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
+ *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
  */
-const nmToken = (str, { xmlVersion = '1.0' } = {}) =>
-  getRegexes(xmlVersion).nmToken.test(str);
+const nmToken = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
+  getRegexes(xmlVersion, asciiOnly).nmToken.test(str);
 
 /**
  * Returns true if the string is a valid NMTokens value.
  * A whitespace-separated list of NMToken values.
  * Used for: DTD NMTOKENS attribute values.
+ *
+ * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
+ *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
  */
-const nmTokens = (str, { xmlVersion = '1.0' } = {}) =>
-  getRegexes(xmlVersion).nmTokens.test(str);
+const nmTokens = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
+  getRegexes(xmlVersion, asciiOnly).nmTokens.test(str);
+
+// ---------------------------------------------------------------------------
+// Memoized validator factory
+//
+// Real documents reuse a small vocabulary of tag/attribute names across many
+// siblings (e.g. `id`, `class`, `href` repeated across hundreds of elements).
+// The plain boolean validators above re-run the regex on every call
+// regardless of repeats. `createValidator` returns a closure with a private
+// string -> boolean cache, so repeated names after the first become O(1)
+// lookups instead of regex tests.
+//
+// - opts (xmlVersion, asciiOnly) are fixed at creation time, so the regex is
+//   resolved once, not on every call.
+// - The cache is private to the returned closure — no shared/global state,
+//   no cross-caller pollution.
+// - `maxCacheSize` bounds memory: once the cache reaches this many entries,
+//   it stops accepting new ones (existing entries keep serving hits; new
+//   misses just fall through to the regex, uncached). This avoids unbounded
+//   growth against adversarial/high-cardinality input (e.g. validating
+//   attacker-supplied names with no repeats) without the cost/complexity of
+//   a full LRU, and without the perf cliff of reset-and-refill thrashing.
+// - Call `.reset()` on the returned function to clear the cache manually
+//   (e.g. between unrelated parse calls).
+// ---------------------------------------------------------------------------
+
+const PRODUCTIONS = ['name', 'ncName', 'qName', 'nmToken', 'nmTokens'];
+
+/**
+ * Returns a memoized boolean validator function for a single production,
+ * with opts fixed at creation time.
+ *
+ * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
+ * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean, maxCacheSize?: number }} [opts]
+ *   maxCacheSize: max number of distinct strings to cache (default 2048).
+ *   Once reached, new strings are validated but not cached; existing cached
+ *   entries keep being served.
+ * @returns {((str: string) => boolean) & { reset: () => void }}
+ */
+const createValidator = (production, { xmlVersion = '1.0', asciiOnly = false, maxCacheSize = 2048 } = {}) => {
+  if (!PRODUCTIONS.includes(production)) {
+    throw new TypeError(
+      `Unknown production "${production}". Must be one of: ${PRODUCTIONS.join(', ')}`
+    );
+  }
+
+  const regex = getRegexes(xmlVersion, asciiOnly)[production];
+  let cache = new Map();
+
+  const validator = (str) => {
+    const cached = cache.get(str);
+    if (cached !== undefined) return cached;
+
+    const result = regex.test(str);
+    if (cache.size < maxCacheSize) cache.set(str, result);
+    return result;
+  };
+
+  validator.reset = () => { cache = new Map(); };
+
+  return validator;
+};
 
 // ---------------------------------------------------------------------------
 // Diagnostic validator
 // ---------------------------------------------------------------------------
-
-const PRODUCTIONS = (/* unused pure expression or super */ null && (['name', 'ncName', 'qName', 'nmToken', 'nmTokens']));
 
 /**
  * Validates a string against a named production and returns a detailed result.
  *
  * @param {string} str
  * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
- * @param {{ xmlVersion?: '1.0'|'1.1' }} [opts]
+ * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
  * @returns {{ valid: boolean, production: string, input: string, reason?: string, position?: number }}
  */
-const validate = (str, production, { xmlVersion = '1.0' } = {}) => {
+const validate = (str, production, { xmlVersion = '1.0', asciiOnly = false } = {}) => {
   if (!PRODUCTIONS.includes(production)) {
     throw new TypeError(
       `Unknown production "${production}". Must be one of: ${PRODUCTIONS.join(', ')}`
@@ -54163,12 +54361,19 @@ const validate = (str, production, { xmlVersion = '1.0' } = {}) => {
   }
 
   const validators = { name: src_name, ncName, qName, nmToken, nmTokens };
-  const isValid = validators[production](str, { xmlVersion });
+  const isValid = validators[production](str, { xmlVersion, asciiOnly });
 
   if (isValid) return { valid: true, production, input: str };
 
   let reason = 'Does not match the production rules';
   let position;
+
+  // Diagnostic fallback char checks must mirror the same character set the
+  // boolean validator above used, or the reported reason/position could
+  // contradict the `valid: false` result (e.g. flagging a char as illegal
+  // that the unicode-aware check would have accepted).
+  const startCharPattern = asciiOnly ? /^[:A-Za-z_]/ : /^[:A-Za-z_\u00C0-\uFFFD]/;
+  const namePattern = asciiOnly ? /[\w\-\\.:]/ : /[\w\-\\.:\u00B7\u00C0-\uFFFD]/;
 
   if (str.length === 0) {
     reason = 'Input is empty';
@@ -54186,13 +54391,13 @@ const validate = (str, production, { xmlVersion = '1.0' } = {}) => {
     position = str.lastIndexOf(':');
   } else if (
     ['name', 'ncName', 'qName'].includes(production) &&
-    !/^[:A-Za-z_\u00C0-\uFFFD]/.test(str[0])
+    !startCharPattern.test(str[0])
   ) {
     reason = `First character "${str[0]}" is not a valid NameStartChar`;
     position = 0;
   } else {
     for (let i = 0; i < str.length; i++) {
-      if (!/[\w\-\\.:\u00B7\u00C0-\uFFFD]/.test(str[i])) {
+      if (!namePattern.test(str[i])) {
         reason = `Character "${str[i]}" at position ${i} is not a valid NameChar`;
         position = i;
         break;
@@ -54212,7 +54417,7 @@ const validate = (str, production, { xmlVersion = '1.0' } = {}) => {
  *
  * @param {string[]} strings
  * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
- * @param {{ xmlVersion?: '1.0'|'1.1' }} [opts]
+ * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
  * @returns {Array<{ valid: boolean, production: string, input: string, reason?: string, position?: number }>}
  */
 const validateAll = (strings, production, opts = {}) =>
@@ -54227,10 +54432,12 @@ const validateAll = (strings, production, opts = {}) =>
  *
  * @param {string} str
  * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
- * @param {{ replacement?: string }} [opts]
+ * @param {{ replacement?: string, asciiOnly?: boolean }} [opts]
+ *   asciiOnly: also replace any non-ASCII character, not just XML-illegal
+ *   ones (default false).
  * @returns {string}
  */
-const sanitize = (str, production = 'name', { replacement = '_' } = {}) => {
+const sanitize = (str, production = 'name', { replacement = '_', asciiOnly = false } = {}) => {
   if (!str) return replacement;
 
   let result = str;
@@ -54241,7 +54448,8 @@ const sanitize = (str, production = 'name', { replacement = '_' } = {}) => {
   }
 
   // Replace illegal characters
-  result = result.replace(/[^\w\-\.:\u00B7\u00C0-\uFFFD]/g, replacement);
+  const allowedCharPattern = asciiOnly ? /[^\w\-\.:]/g : /[^\w\-\.:\u00B7\u00C0-\uFFFD]/g;
+  result = result.replace(allowedCharPattern, replacement);
 
   // Fix invalid start character for Name / NCName / QName
   if (production !== 'nmToken' && production !== 'nmTokens') {
@@ -54291,11 +54499,11 @@ function detectXmlVersionFromArray(jArray, options) {
  * @param {boolean} isAttribute - true when resolving an attribute name
  * @param {object}  options
  * @param {Matcher} matcher     - current matcher state (readonly from callback perspective)
- * @param {string}  xmlVersion  - '1.0' or '1.1', forwarded to xml-naming
+ * @param {function} qNameValidator - function to validate tag names
  */
-function resolveTagName(name, isAttribute, options, matcher, xmlVersion) {
+function resolveTagName(name, isAttribute, options, matcher, qNameValidator) {
     if (!options.sanitizeName) return name;
-    if (qName(name, { xmlVersion })) return name;
+    if (qNameValidator(name)) return name;
     return options.sanitizeName(name, { isAttribute, matcher: matcher.readOnly() });
 }
 
@@ -54325,14 +54533,14 @@ function toXml(jArray, options) {
 
     // Detect XML version for use in name validation
     const xmlVersion = detectXmlVersionFromArray(jArray, options);
-
+    const qNameValidator = createValidator('qName', { xmlVersion });
     // Initialize matcher for path tracking
     const matcher = new Matcher();
 
-    return arrToStr(jArray, options, indentation, matcher, stopNodeExpressions, xmlVersion);
+    return arrToStr(jArray, options, indentation, matcher, stopNodeExpressions, qNameValidator);
 }
 
-function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, xmlVersion) {
+function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, qNameValidator) {
     let xmlStr = "";
     let isPreviousElementTag = false;
 
@@ -54365,7 +54573,7 @@ function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, xmlVe
         // Resolve tag name (may transform it; may throw for invalid names)
         const tagName = isSpecialName
             ? rawTagName
-            : resolveTagName(rawTagName, false, options, matcher, xmlVersion);
+            : resolveTagName(rawTagName, false, options, matcher, qNameValidator);
 
         // Extract attributes from ":@" property
         const attrValues = extractAttributeValues(tagObj[":@"], options);
@@ -54407,7 +54615,7 @@ function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, xmlVe
             matcher.pop();
             continue;
         } else if (tagName[0] === "?") {
-            const attStr = attr_to_str(tagObj[":@"], options, isStopNode, matcher, xmlVersion);
+            const attStr = attr_to_str(tagObj[":@"], options, isStopNode, matcher, qNameValidator);
             const tempInd = tagName === "?xml" ? "" : indentation;
             // Text node content on PI/XML declaration tags is intentionally ignored.
             // Only attributes are valid on these tags per the XML spec.
@@ -54423,7 +54631,7 @@ function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, xmlVe
         }
 
         // Pass isStopNode to attr_to_str so attributes are also not processed for stopNodes
-        const attStr = attr_to_str(tagObj[":@"], options, isStopNode, matcher, xmlVersion);
+        const attStr = attr_to_str(tagObj[":@"], options, isStopNode, matcher, qNameValidator);
         const tagStart = indentation + `<${tagName}${attStr}`;
 
         // If this is a stopNode, get raw content without processing
@@ -54431,7 +54639,7 @@ function arrToStr(arr, options, indentation, matcher, stopNodeExpressions, xmlVe
         if (isStopNode) {
             tagValue = orderedJs2Xml_getRawContent(tagObj[rawTagName], options);
         } else {
-            tagValue = arrToStr(tagObj[rawTagName], options, newIdentation, matcher, stopNodeExpressions, xmlVersion);
+            tagValue = arrToStr(tagObj[rawTagName], options, newIdentation, matcher, stopNodeExpressions, qNameValidator);
         }
 
         if (options.unpairedTags.indexOf(tagName) !== -1) {
@@ -54560,7 +54768,7 @@ function propName(obj) {
  * Build attribute string, resolving attribute names through sanitizeName when configured.
  * Accepts matcher so the callback has path context.
  */
-function attr_to_str(attrMap, options, isStopNode, matcher, xmlVersion) {
+function attr_to_str(attrMap, options, isStopNode, matcher, qNameValidator) {
     let attrStr = "";
     if (attrMap && !options.ignoreAttributes) {
         for (let attr in attrMap) {
@@ -54570,7 +54778,7 @@ function attr_to_str(attrMap, options, isStopNode, matcher, xmlVersion) {
             const cleanAttrName = attr.substr(options.attributeNamePrefix.length);
             const resolvedAttrName = isStopNode
                 ? cleanAttrName  // stopNodes are raw — skip sanitizeName for attr names too
-                : resolveTagName(cleanAttrName, true, options, matcher, xmlVersion);
+                : resolveTagName(cleanAttrName, true, options, matcher, qNameValidator);
 
             let attrVal;
             if (isStopNode) {
@@ -54764,11 +54972,11 @@ function detectXmlVersionFromObj(jObj, options) {
  * @param {boolean} isAttribute - true when resolving an attribute name
  * @param {object}  options
  * @param {Matcher} matcher     - current matcher state (readonly from callback perspective)
- * @param {string}  xmlVersion  - '1.0' or '1.1', forwarded to xml-naming
+ * @param {function} qNameValidator - function to validate tag names
  */
-function fxb_resolveTagName(name, isAttribute, options, matcher, xmlVersion) {
+function fxb_resolveTagName(name, isAttribute, options, matcher, qNameValidator) {
   if (!options.sanitizeName) return name;
-  if (qName(name, { xmlVersion })) return name;
+  if (qNameValidator(name)) return name;
   return options.sanitizeName(name, { isAttribute, matcher: matcher.readOnly() });
 }
 
@@ -54784,11 +54992,12 @@ Builder.prototype.build = function (jObj) {
     // Initialize matcher for path tracking
     const matcher = new Matcher();
     const xmlVersion = detectXmlVersionFromObj(jObj, this.options);
-    return this.j2x(jObj, 0, matcher, xmlVersion).val;
+    const qNameValidator = createValidator('qName', { xmlVersion });
+    return this.j2x(jObj, 0, matcher, qNameValidator).val;
   }
 };
 
-Builder.prototype.j2x = function (jObj, level, matcher, xmlVersion) {
+Builder.prototype.j2x = function (jObj, level, matcher, qNameValidator) {
   let attrStr = '';
   let val = '';
   if (this.options.maxNestedTags && matcher.getDepth() >= this.options.maxNestedTags) {
@@ -54816,7 +55025,7 @@ Builder.prototype.j2x = function (jObj, level, matcher, xmlVersion) {
 
     const resolvedKey = isSpecialKey
       ? key
-      : fxb_resolveTagName(key, false, this.options, matcher, xmlVersion);
+      : fxb_resolveTagName(key, false, this.options, matcher, qNameValidator);
 
     if (typeof jObj[key] === 'undefined') {
       // supress undefined node only if it is not an attribute
@@ -54841,7 +55050,7 @@ Builder.prototype.j2x = function (jObj, level, matcher, xmlVersion) {
       const attr = this.isAttribute(key);
       if (attr && !this.ignoreAttributesFn(attr, jPath)) {
         // Resolve the attribute name through sanitizeName
-        const resolvedAttr = fxb_resolveTagName(attr, true, this.options, matcher, xmlVersion);
+        const resolvedAttr = fxb_resolveTagName(attr, true, this.options, matcher, qNameValidator);
         attrStr += this.buildAttrPairStr(resolvedAttr, '' + jObj[key], isCurrentStopNode);
       } else if (!attr) {
         //tag value
@@ -54883,7 +55092,7 @@ Builder.prototype.j2x = function (jObj, level, matcher, xmlVersion) {
           if (this.options.oneListGroup) {
             // Push tag to matcher before recursive call
             matcher.push(resolvedKey);
-            const result = this.j2x(item, level + 1, matcher, xmlVersion);
+            const result = this.j2x(item, level + 1, matcher, qNameValidator);
             // Pop tag from matcher after recursive call
             matcher.pop();
 
@@ -54892,7 +55101,7 @@ Builder.prototype.j2x = function (jObj, level, matcher, xmlVersion) {
               listTagAttr += result.attrStr
             }
           } else {
-            listTagVal += this.processTextOrObjNode(item, resolvedKey, level, matcher, xmlVersion)
+            listTagVal += this.processTextOrObjNode(item, resolvedKey, level, matcher, qNameValidator)
           }
         } else {
           if (this.options.oneListGroup) {
@@ -54930,11 +55139,11 @@ Builder.prototype.j2x = function (jObj, level, matcher, xmlVersion) {
         const L = Ks.length;
         for (let j = 0; j < L; j++) {
           // Resolve attribute names inside attributesGroupName
-          const resolvedAttr = fxb_resolveTagName(Ks[j], true, this.options, matcher, xmlVersion);
+          const resolvedAttr = fxb_resolveTagName(Ks[j], true, this.options, matcher, qNameValidator);
           attrStr += this.buildAttrPairStr(resolvedAttr, '' + jObj[key][Ks[j]], isCurrentStopNode);
         }
       } else {
-        val += this.processTextOrObjNode(jObj[key], resolvedKey, level, matcher, xmlVersion)
+        val += this.processTextOrObjNode(jObj[key], resolvedKey, level, matcher, qNameValidator)
       }
     }
   }
@@ -54951,7 +55160,7 @@ Builder.prototype.buildAttrPairStr = function (attrName, val, isStopNode) {
   } else return ' ' + attrName + '="' + escapeAttribute(val) + '"';
 }
 
-function processTextOrObjNode(object, key, level, matcher, xmlVersion) {
+function processTextOrObjNode(object, key, level, matcher, qNameValidator) {
   // Extract attributes to pass to matcher
   const attrValues = this.extractAttributes(object);
 
@@ -54969,7 +55178,7 @@ function processTextOrObjNode(object, key, level, matcher, xmlVersion) {
     return this.buildObjectNode(rawContent, key, attrStr, level);
   }
 
-  const result = this.j2x(object, level + 1, matcher, xmlVersion);
+  const result = this.j2x(object, level + 1, matcher, qNameValidator);
   // Pop tag from matcher after recursion
   matcher.pop();
 
@@ -55098,7 +55307,9 @@ Builder.prototype.buildAttributesForStopNode = function (obj) {
       if (val === true && this.options.suppressBooleanAttributes) {
         attrStr += ' ' + cleanKey;
       } else {
-        attrStr += ' ' + cleanKey + '="' + val + '"'; // No encoding for stopNode
+        // stopNode content is raw, but the quote delimiter is always escaped
+        // so a quote in the value cannot break out of the attribute (see orderedJs2Xml attr_to_str)
+        attrStr += ' ' + cleanKey + '="' + escapeAttribute(val) + '"';
       }
     }
   } else {
@@ -55111,7 +55322,9 @@ Builder.prototype.buildAttributesForStopNode = function (obj) {
         if (val === true && this.options.suppressBooleanAttributes) {
           attrStr += ' ' + attr;
         } else {
-          attrStr += ' ' + attr + '="' + val + '"'; // No encoding for stopNode
+          // stopNode content is raw, but the quote delimiter is always escaped
+          // so a quote in the value cannot break out of the attribute (see orderedJs2Xml attr_to_str)
+          attrStr += ' ' + attr + '="' + escapeAttribute(val) + '"';
         }
       }
     }
@@ -55142,7 +55355,7 @@ Builder.prototype.buildObjectNode = function (val, key, attrStr, level) {
     if ((attrStr || attrStr === '') && val.indexOf('<') === -1) {
       return (this.indentate(level) + '<' + key + attrStr + piClosingChar + '>' + val + tagEndExp);
     } else if (this.options.commentPropName !== false && key === this.options.commentPropName && piClosingChar.length === 0) {
-      return this.indentate(level) + `<!--${val}-->` + this.newLine;
+      return this.indentate(level) + `<!--${safeComment(val)}-->` + this.newLine;
     } else {
       return (
         this.indentate(level) + '<' + key + attrStr + piClosingChar + this.tagEndChar +
@@ -55945,389 +56158,6 @@ class XmlNode {
   }
 }
 
-;// CONCATENATED MODULE: ./node_modules/fast-xml-parser/node_modules/xml-naming/src/index.js
-/**
- * xml-naming
- * Validates XML Name productions as defined in the XML 1.0 and 1.1 specifications.
- * Covers: Name, NCName, QName, NMToken, NMTokens
- *
- * XML 1.0 spec: https://www.w3.org/TR/xml/#NT-Name
- * XML 1.1 spec: https://www.w3.org/TR/xml11/#NT-NameStartChar
- * XML NS spec:  https://www.w3.org/TR/xml-names/#NT-NCName
- */
-
-// ---------------------------------------------------------------------------
-// Character class strings — XML 1.0
-//
-// NameStartChar ::= ":" | [A-Z] | "_" | [a-z]
-//   | [#xC0-#xD6]   | [#xD8-#xF6]   | [#xF8-#x2FF]
-//   | [#x370-#x37D] | [#x37F-#x1FFF]    <- split to exclude #x0487
-//   | [#x200C-#x200D]
-//   | [#x2070-#x218F] | [#x2C00-#x2FEF]
-//   | [#x3001-#xD7FF] | [#xF900-#xFDCF] | [#xFDF0-#xFFFD]
-//
-// NameChar ::= NameStartChar | "-" | "." | [0-9]
-//   | #xB7 | [#x0300-#x036F] | [#x203F-#x2040]
-//
-// Note: \u0487 (Combining Cyrillic Millions Sign) was added in Unicode 4.0,
-// after XML 1.0 was defined against Unicode 2.0. It falls inside the range
-// \u037F-\u1FFF but must be excluded. We split that range into
-// \u037F-\u0486 and \u0488-\u1FFF to exclude it explicitly.
-// ---------------------------------------------------------------------------
-
-const src_nameStartChar10 =
-  ':A-Za-z_' +
-  '\u00C0-\u00D6\u00D8-\u00F6\u00F8-\u02FF' +
-  '\u0370-\u037D' +
-  '\u037F-\u0486\u0488-\u1FFF' +  // split to exclude \u0487
-  '\u200C-\u200D' +
-  '\u2070-\u218F' +
-  '\u2C00-\u2FEF' +
-  '\u3001-\uD7FF' +
-  '\uF900-\uFDCF' +
-  '\uFDF0-\uFFFD';
-
-const src_nameChar10 =
-  src_nameStartChar10 +
-  '\\-\\.\\d' +
-  '\u00B7' +
-  '\u0300-\u036F' +
-  '\u203F-\u2040';
-
-// ---------------------------------------------------------------------------
-// Character class strings — XML 1.1
-//
-// Differences from XML 1.0:
-//
-// NameStartChar:
-//   1.0 has split ranges: \u00C0-\u00D6, \u00D8-\u00F6, \u00F8-\u02FF
-//   1.1 merges them into: \u00C0-\u02FF
-//   (\u00D7 x and \u00F7 / are division symbols, excluded in both versions)
-//
-//   1.0 tops out at \uFFFD (BMP only)
-//   1.1 adds \u{10000}-\u{EFFFF} (supplementary planes)
-//   These require the /u flag on the RegExp — see buildRegexes below.
-//
-// NameChar:
-//   1.1 adds \u0487 (Combining Cyrillic Millions Sign, added in Unicode 4.0)
-// ---------------------------------------------------------------------------
-
-const src_nameStartChar11 =
-  ':A-Za-z_' +
-  '\u00C0-\u02FF' +                    // merged — 1.0 had three split ranges here
-  '\u0370-\u037D' +
-  '\u037F-\u0486\u0488-\u1FFF' +       // split to exclude \u0487 (combining mark, never a NameStartChar)
-  '\u200C-\u200D' +
-  '\u2070-\u218F' +
-  '\u2C00-\u2FEF' +
-  '\u3001-\uD7FF' +
-  '\uF900-\uFDCF' +
-  '\uFDF0-\uFFFD' +
-  '\u{10000}-\u{EFFFF}';     // supplementary planes — REQUIRES /u flag on RegExp
-
-const src_nameChar11 =
-  src_nameStartChar11 +
-  '\\-\\.\\d' +
-  '\u00B7' +
-  '\u0300-\u036F' +
-  '\u0487' +                 // Combining Cyrillic Millions Sign — valid in 1.1, not 1.0
-  '\u203F-\u2040';
-
-// ---------------------------------------------------------------------------
-// Regex builders
-//
-// XML 1.0 regexes: no flags — BMP only, standard JS regex behaviour.
-// XML 1.1 regexes: /u flag — required for \u{10000}-\u{EFFFF} to match actual
-//   supplementary code points rather than lone surrogates (which are illegal XML).
-// ---------------------------------------------------------------------------
-
-const src_buildRegexes = (startChar, char, flags = '') => {
-  const ncStart = startChar.replace(':', '');
-  const ncChar = char.replace(':', '');
-  const ncNamePat = `[${ncStart}][${ncChar}]*`;
-
-  return {
-    name: new RegExp(`^[${startChar}][${char}]*$`, flags),
-    ncName: new RegExp(`^${ncNamePat}$`, flags),
-    qName: new RegExp(`^${ncNamePat}(?::${ncNamePat})?$`, flags),
-    nmToken: new RegExp(`^[${char}]+$`, flags),
-    nmTokens: new RegExp(`^[${char}]+(?:\\s+[${char}]+)*$`, flags),
-  };
-};
-
-const src_regexes10 = src_buildRegexes(src_nameStartChar10, src_nameChar10);       // no /u — BMP only
-const src_regexes11 = src_buildRegexes(src_nameStartChar11, src_nameChar11, 'u');  // /u — enables \u{10000}-\u{EFFFF}
-
-// ---------------------------------------------------------------------------
-// ASCII-only fast path (opt-in, off by default)
-//
-// The XML 1.0 vs 1.1 NameStartChar/NameChar productions differ *only* in
-// their non-ASCII ranges (merged vs split Latin-1 ranges, \u0487, and
-// supplementary planes). Restricted to ASCII, both versions collapse to the
-// same character classes, so a single regex pair covers both xmlVersion
-// values — no /u flag needed.
-//
-// Rationale: unicode-aware regexes (the /u flag, required for XML 1.1's
-// supplementary-plane range) are measurably slower in V8 than plain
-// non-unicode regexes on the same input, even when the input is pure ASCII.
-// For the common case — HTML/SVG ids, XML tags — names are ASCII, so callers
-// who know this can opt in to skip the unicode-aware matching path entirely.
-// This is a real but *conditional* win: mainly for XML 1.1 input (avoids /u),
-// or at scale where the larger unicode character classes add engine
-// overhead. It also changes behaviour (rejects legitimate non-ASCII XML
-// 1.0/1.1 names), so it must never be silently enabled — hence off by
-// default.
-// ---------------------------------------------------------------------------
-
-const nameStartCharAscii = ':A-Za-z_';
-const nameCharAscii = nameStartCharAscii + '\\-\\.\\d';
-
-const regexesAscii = src_buildRegexes(nameStartCharAscii, nameCharAscii); // no /u — ASCII only
-
-const src_getRegexes = (xmlVersion = '1.0', asciiOnly = false) => {
-  if (asciiOnly) return regexesAscii;
-  return xmlVersion === '1.1' ? src_regexes11 : src_regexes10;
-};
-
-// ---------------------------------------------------------------------------
-// Boolean validators
-// ---------------------------------------------------------------------------
-
-/**
- * Returns true if the string is a valid XML Name.
- * Colons are allowed anywhere (Name production).
- * Used for: DOCTYPE entity names, notation names, DTD element declarations.
- *
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
- */
-const xml_naming_src_name = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
-  src_getRegexes(xmlVersion, asciiOnly).name.test(str);
-
-/**
- * Returns true if the string is a valid NCName (Non-Colonized Name).
- * Colons are not permitted.
- * Used for: namespace prefixes, local names, SVG id attributes.
- *
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
- */
-const src_ncName = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
-  src_getRegexes(xmlVersion, asciiOnly).ncName.test(str);
-
-/**
- * Returns true if the string is a valid QName (Qualified Name).
- * Allows exactly one colon as a prefix separator: prefix:localName.
- * Used for: element and attribute names in namespace-aware XML/SVG.
- *
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
- */
-const src_qName = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
-  src_getRegexes(xmlVersion, asciiOnly).qName.test(str);
-
-/**
- * Returns true if the string is a valid NMToken.
- * Like Name but no restriction on the first character.
- * Used for: DTD NMTOKEN attribute values.
- *
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
- */
-const src_nmToken = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
-  src_getRegexes(xmlVersion, asciiOnly).nmToken.test(str);
-
-/**
- * Returns true if the string is a valid NMTokens value.
- * A whitespace-separated list of NMToken values.
- * Used for: DTD NMTOKENS attribute values.
- *
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- *   asciiOnly: skip unicode-aware matching, ASCII names only (default false).
- */
-const src_nmTokens = (str, { xmlVersion = '1.0', asciiOnly = false } = {}) =>
-  src_getRegexes(xmlVersion, asciiOnly).nmTokens.test(str);
-
-// ---------------------------------------------------------------------------
-// Memoized validator factory
-//
-// Real documents reuse a small vocabulary of tag/attribute names across many
-// siblings (e.g. `id`, `class`, `href` repeated across hundreds of elements).
-// The plain boolean validators above re-run the regex on every call
-// regardless of repeats. `createValidator` returns a closure with a private
-// string -> boolean cache, so repeated names after the first become O(1)
-// lookups instead of regex tests.
-//
-// - opts (xmlVersion, asciiOnly) are fixed at creation time, so the regex is
-//   resolved once, not on every call.
-// - The cache is private to the returned closure — no shared/global state,
-//   no cross-caller pollution.
-// - `maxCacheSize` bounds memory: once the cache reaches this many entries,
-//   it stops accepting new ones (existing entries keep serving hits; new
-//   misses just fall through to the regex, uncached). This avoids unbounded
-//   growth against adversarial/high-cardinality input (e.g. validating
-//   attacker-supplied names with no repeats) without the cost/complexity of
-//   a full LRU, and without the perf cliff of reset-and-refill thrashing.
-// - Call `.reset()` on the returned function to clear the cache manually
-//   (e.g. between unrelated parse calls).
-// ---------------------------------------------------------------------------
-
-const src_PRODUCTIONS = (/* unused pure expression or super */ null && (['name', 'ncName', 'qName', 'nmToken', 'nmTokens']));
-
-/**
- * Returns a memoized boolean validator function for a single production,
- * with opts fixed at creation time.
- *
- * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean, maxCacheSize?: number }} [opts]
- *   maxCacheSize: max number of distinct strings to cache (default 2048).
- *   Once reached, new strings are validated but not cached; existing cached
- *   entries keep being served.
- * @returns {((str: string) => boolean) & { reset: () => void }}
- */
-const createValidator = (production, { xmlVersion = '1.0', asciiOnly = false, maxCacheSize = 2048 } = {}) => {
-  if (!src_PRODUCTIONS.includes(production)) {
-    throw new TypeError(
-      `Unknown production "${production}". Must be one of: ${src_PRODUCTIONS.join(', ')}`
-    );
-  }
-
-  const regex = src_getRegexes(xmlVersion, asciiOnly)[production];
-  let cache = new Map();
-
-  const validator = (str) => {
-    const cached = cache.get(str);
-    if (cached !== undefined) return cached;
-
-    const result = regex.test(str);
-    if (cache.size < maxCacheSize) cache.set(str, result);
-    return result;
-  };
-
-  validator.reset = () => { cache = new Map(); };
-
-  return validator;
-};
-
-// ---------------------------------------------------------------------------
-// Diagnostic validator
-// ---------------------------------------------------------------------------
-
-/**
- * Validates a string against a named production and returns a detailed result.
- *
- * @param {string} str
- * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- * @returns {{ valid: boolean, production: string, input: string, reason?: string, position?: number }}
- */
-const src_validate = (str, production, { xmlVersion = '1.0', asciiOnly = false } = {}) => {
-  if (!src_PRODUCTIONS.includes(production)) {
-    throw new TypeError(
-      `Unknown production "${production}". Must be one of: ${src_PRODUCTIONS.join(', ')}`
-    );
-  }
-
-  const validators = { name: xml_naming_src_name, ncName: src_ncName, qName: src_qName, nmToken: src_nmToken, nmTokens: src_nmTokens };
-  const isValid = validators[production](str, { xmlVersion, asciiOnly });
-
-  if (isValid) return { valid: true, production, input: str };
-
-  let reason = 'Does not match the production rules';
-  let position;
-
-  // Diagnostic fallback char checks must mirror the same character set the
-  // boolean validator above used, or the reported reason/position could
-  // contradict the `valid: false` result (e.g. flagging a char as illegal
-  // that the unicode-aware check would have accepted).
-  const startCharPattern = asciiOnly ? /^[:A-Za-z_]/ : /^[:A-Za-z_\u00C0-\uFFFD]/;
-  const namePattern = asciiOnly ? /[\w\-\\.:]/ : /[\w\-\\.:\u00B7\u00C0-\uFFFD]/;
-
-  if (str.length === 0) {
-    reason = 'Input is empty';
-  } else if (production === 'ncName' && str.includes(':')) {
-    position = str.indexOf(':');
-    reason = 'Colon is not allowed in NCName';
-  } else if (production === 'qName' && str.startsWith(':')) {
-    reason = 'QName cannot start with a colon';
-    position = 0;
-  } else if (production === 'qName' && str.endsWith(':')) {
-    reason = 'QName cannot end with a colon';
-    position = str.length - 1;
-  } else if (production === 'qName' && (str.match(/:/g) || []).length > 1) {
-    reason = 'QName can have at most one colon';
-    position = str.lastIndexOf(':');
-  } else if (
-    ['name', 'ncName', 'qName'].includes(production) &&
-    !startCharPattern.test(str[0])
-  ) {
-    reason = `First character "${str[0]}" is not a valid NameStartChar`;
-    position = 0;
-  } else {
-    for (let i = 0; i < str.length; i++) {
-      if (!namePattern.test(str[i])) {
-        reason = `Character "${str[i]}" at position ${i} is not a valid NameChar`;
-        position = i;
-        break;
-      }
-    }
-  }
-
-  return { valid: false, production, input: str, reason, position };
-};
-
-// ---------------------------------------------------------------------------
-// Batch validator
-// ---------------------------------------------------------------------------
-
-/**
- * Validates an array of strings against a named production.
- *
- * @param {string[]} strings
- * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
- * @param {{ xmlVersion?: '1.0'|'1.1', asciiOnly?: boolean }} [opts]
- * @returns {Array<{ valid: boolean, production: string, input: string, reason?: string, position?: number }>}
- */
-const src_validateAll = (strings, production, opts = {}) =>
-  strings.map(str => src_validate(str, production, opts));
-
-// ---------------------------------------------------------------------------
-// Sanitizer
-// ---------------------------------------------------------------------------
-
-/**
- * Transforms an invalid string into the nearest valid XML name for the given production.
- *
- * @param {string} str
- * @param {'name'|'ncName'|'qName'|'nmToken'|'nmTokens'} production
- * @param {{ replacement?: string, asciiOnly?: boolean }} [opts]
- *   asciiOnly: also replace any non-ASCII character, not just XML-illegal
- *   ones (default false).
- * @returns {string}
- */
-const src_sanitize = (str, production = 'name', { replacement = '_', asciiOnly = false } = {}) => {
-  if (!str) return replacement;
-
-  let result = str;
-
-  // Strip colons for NCName
-  if (production === 'ncName') {
-    result = result.replace(/:/g, '');
-  }
-
-  // Replace illegal characters
-  const allowedCharPattern = asciiOnly ? /[^\w\-\.:]/g : /[^\w\-\.:\u00B7\u00C0-\uFFFD]/g;
-  result = result.replace(allowedCharPattern, replacement);
-
-  // Fix invalid start character for Name / NCName / QName
-  if (production !== 'nmToken' && production !== 'nmTokens') {
-    if (/^[\-\.\d]/.test(result)) {
-      result = replacement + result;
-    }
-  }
-
-  return result || replacement;
-};
 ;// CONCATENATED MODULE: ./node_modules/fast-xml-parser/src/xmlparser/DocTypeReader.js
 
 
@@ -56561,7 +56391,7 @@ class DocTypeReader {
         let elementName = xmlData.substring(startIndex, i);
 
         // Validate element name
-        if (!this.suppressValidationErr && !src_qName(elementName, { xmlVersion: this.xmlVersion })) {
+        if (!this.suppressValidationErr && !qName(elementName, { xmlVersion: this.xmlVersion })) {
             throw new Error(`Invalid element name: "${elementName}"`);
         }
 
@@ -56735,7 +56565,7 @@ function hasSeq(data, seq, i) {
 }
 
 function validateEntityName(name, xmlVersion) {
-    if (src_qName(name, { xmlVersion: xmlVersion }))
+    if (qName(name, { xmlVersion: xmlVersion }))
         return name;
     else
         throw new Error(`Invalid entity name ${name}`);
@@ -61444,7 +61274,8 @@ async function parseXML(str, opts = {}) {
         delete parsedXml["?xml"];
     }
     if (!opts.includeRoot) {
-        for (const key of Object.keys(parsedXml)) {
+        const key = Object.keys(parsedXml)[0];
+        if (key !== undefined) {
             const value = parsedXml[key];
             return typeof value === "object" ? { ...value } : value;
         }
@@ -62078,6 +61909,7 @@ function logExceptionOnExit(e) {
 
 if (ENVIRONMENT_IS_NODE) {
   if (typeof process == 'undefined' || !process.release || process.release.name !== 'node') throw new Error('not compiled for this environment (did you build to HTML and try to run it not on the web, or set ENVIRONMENT to something - like node - and run it someplace else - like on the web?)');
+// NODE-READ-START (this block is replaced with a no-op in dist/browser and dist/react-native by copyJSFiles.cjs)
   // `require()` is no-op in an ESM module, use `createRequire()` to construct
   // the require()` function.  This is only necessary for multi-environment
   // builds, `-sENVIRONMENT=node` emits a static import declaration instead.
@@ -62122,6 +61954,7 @@ readAsync = (filename, onload, onerror) => {
 };
 
 // end include: node_shell_read.js
+// NODE-READ-END
   if (process['argv'].length > 1) {
     thisProgram = process['argv'][1].replace(/\\/g, '/');
   }
@@ -67357,8 +67190,8 @@ class UserDelegationKeyCredential {
 ;// CONCATENATED MODULE: ./node_modules/@azure/storage-blob/dist/esm/utils/constants.js
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
-const esm_utils_constants_SDK_VERSION = "12.32.0";
-const SERVICE_VERSION = "2026-04-06";
+const esm_utils_constants_SDK_VERSION = "12.33.0";
+const SERVICE_VERSION = "2026-06-06";
 const BLOCK_BLOB_MAX_UPLOAD_BLOB_BYTES = 256 * 1024 * 1024; // 256MB
 const BLOCK_BLOB_MAX_STAGE_BLOCK_BYTES = 4000 * 1024 * 1024; // 4000MB
 const BLOCK_BLOB_MAX_BLOCKS = 50000;
@@ -69441,6 +69274,7 @@ const BlobPropertiesInternal = {
                         "Cool",
                         "Archive",
                         "Cold",
+                        "Smart",
                     ],
                 },
             },
@@ -69460,6 +69294,32 @@ const BlobPropertiesInternal = {
                         "rehydrate-pending-to-hot",
                         "rehydrate-pending-to-cool",
                         "rehydrate-pending-to-cold",
+                        "rehydrate-pending-to-smart",
+                    ],
+                },
+            },
+            smartAccessTier: {
+                serializedName: "SmartAccessTier",
+                xmlName: "SmartAccessTier",
+                type: {
+                    name: "Enum",
+                    allowedValues: [
+                        "P4",
+                        "P6",
+                        "P10",
+                        "P15",
+                        "P20",
+                        "P30",
+                        "P40",
+                        "P50",
+                        "P60",
+                        "P70",
+                        "P80",
+                        "Hot",
+                        "Cool",
+                        "Archive",
+                        "Cold",
+                        "Smart",
                     ],
                 },
             },
@@ -72603,6 +72463,13 @@ const BlobGetPropertiesHeaders = {
                 xmlName: "x-ms-access-tier-change-time",
                 type: {
                     name: "DateTimeRfc1123",
+                },
+            },
+            smartAccessTier: {
+                serializedName: "x-ms-smart-access-tier",
+                xmlName: "x-ms-smart-access-tier",
+                type: {
+                    name: "String",
                 },
             },
             versionId: {
@@ -76599,7 +76466,7 @@ const timeoutInSeconds = {
 const version = {
     parameterPath: "version",
     mapper: {
-        defaultValue: "2026-04-06",
+        defaultValue: "2026-06-06",
         isConstant: true,
         serializedName: "x-ms-version",
         type: {
@@ -77506,6 +77373,7 @@ const tier = {
                 "Cool",
                 "Archive",
                 "Cold",
+                "Smart",
             ],
         },
     },
@@ -77744,6 +77612,7 @@ const tier1 = {
                 "Cool",
                 "Archive",
                 "Cold",
+                "Smart",
             ],
         },
     },
@@ -81452,7 +81321,7 @@ class StorageClient extends ExtendedServiceClient {
         const defaults = {
             requestContentType: "application/json; charset=utf-8",
         };
-        const packageDetails = `azsdk-js-azure-storage-blob/12.32.0`;
+        const packageDetails = `azsdk-js-azure-storage-blob/12.33.0`;
         const userAgentPrefix = options.userAgentOptions && options.userAgentOptions.userAgentPrefix
             ? `${options.userAgentOptions.userAgentPrefix} ${packageDetails}`
             : `${packageDetails}`;
@@ -81468,7 +81337,7 @@ class StorageClient extends ExtendedServiceClient {
         // Parameter assignments
         this.url = url;
         // Assigning values to Constant parameters
-        this.version = options.version || "2026-04-06";
+        this.version = options.version || "2026-06-06";
         this.service = new ServiceImpl(this);
         this.container = new ContainerImpl(this);
         this.blob = new BlobImpl(this);
@@ -81521,6 +81390,13 @@ class StorageContextClient extends StorageClient {
 
 
 
+const accountNameSuffixes = [
+    "-secondary-ipv6",
+    "-secondary-dualstack",
+    "-ipv6",
+    "-dualstack",
+    "-secondary",
+];
 /**
  * Reserved URL characters must be properly escaped for Storage services like Blob or File.
  *
@@ -81997,7 +81873,15 @@ function utils_common_getAccountNameFromUrl(url) {
     try {
         if (parsedUrl.hostname.split(".")[1] === "blob") {
             // `${defaultEndpointsProtocol}://${accountName}.blob.${endpointSuffix}`;
+            // `${defaultEndpointsProtocol}://${accountName}-suffix.blob.${endpointSuffix}`;
             accountName = parsedUrl.hostname.split(".")[0];
+            for (let i = 0; i < accountNameSuffixes.length; ++i) {
+                const suffix = accountNameSuffixes[i];
+                if (accountName.endsWith(suffix)) {
+                    accountName = accountName.substring(0, accountName.length - suffix.length);
+                    break;
+                }
+            }
         }
         else if (utils_common_isIpEndpointStyle(parsedUrl)) {
             // IPv4/IPv6 address hosts... Example - http://192.0.0.10:10001/devstoreaccount1/
@@ -82971,6 +82855,10 @@ class SASQueryParameters {
      * Keys for request query parameters required in the SAS token
      */
     requestQueryParameterKeys;
+    /** To indicate the depth of the virtual blob directory specified
+     * in the canonicalizedresource field of the string-to-sign.
+     */
+    directoryDepth;
     /**
      * Optional. IP range allowed for this SAS.
      *
@@ -82985,7 +82873,7 @@ class SASQueryParameters {
         }
         return undefined;
     }
-    constructor(version, signature, permissionsOrOptions, services, resourceTypes, protocol, startsOn, expiresOn, ipRange, identifier, resource, cacheControl, contentDisposition, contentEncoding, contentLanguage, contentType, userDelegationKey, preauthorizedAgentObjectId, correlationId, encryptionScope, delegatedUserObjectId, requestHeaderKeys, requestQueryParameterKeys) {
+    constructor(version, signature, permissionsOrOptions, services, resourceTypes, protocol, startsOn, expiresOn, ipRange, identifier, resource, cacheControl, contentDisposition, contentEncoding, contentLanguage, contentType, userDelegationKey, preauthorizedAgentObjectId, correlationId, encryptionScope, delegatedUserObjectId, requestHeaderKeys, requestQueryParameterKeys, directoryDepth) {
         this.version = version;
         this.signature = signature;
         if (permissionsOrOptions !== undefined && typeof permissionsOrOptions !== "string") {
@@ -83008,6 +82896,7 @@ class SASQueryParameters {
             this.contentType = permissionsOrOptions.contentType;
             this.requestHeaderKeys = permissionsOrOptions.requestHeaderKeys;
             this.requestQueryParameterKeys = permissionsOrOptions.requestQueryParameterKeys;
+            this.directoryDepth = permissionsOrOptions.directoryDepth;
             if (permissionsOrOptions.userDelegationKey) {
                 this.signedOid = permissionsOrOptions.userDelegationKey.signedObjectId;
                 this.signedTenantId = permissionsOrOptions.userDelegationKey.signedTenantId;
@@ -83040,6 +82929,7 @@ class SASQueryParameters {
             this.contentType = contentType;
             this.requestHeaderKeys = requestHeaderKeys;
             this.requestQueryParameterKeys = requestQueryParameterKeys;
+            this.directoryDepth = directoryDepth;
             if (userDelegationKey) {
                 this.signedOid = userDelegationKey.signedObjectId;
                 this.signedTenantId = userDelegationKey.signedTenantId;
@@ -83083,6 +82973,7 @@ class SASQueryParameters {
             "rsct",
             "saoid",
             "scid",
+            "sdd",
             "sduoid", // Signed key user delegation object ID
             "skdutid", // Signed key user delegation tenant ID
             "srh", // Request Headers
@@ -83179,6 +83070,9 @@ class SASQueryParameters {
                 case "srq": // Request headers
                     this.tryAppendQueryParameter(queries, param, this.requestQueryParameterKeys);
                     break;
+                case "sdd": // Directory depth
+                    this.tryAppendQueryParameter(queries, param, this.directoryDepth !== undefined ? this.directoryDepth.toString() : "");
+                    break;
             }
         }
         return queries.join("&");
@@ -83250,7 +83144,13 @@ function generateBlobSASQueryParametersInternal(blobSASSignatureValues, sharedKe
     // https://learn.microsoft.com/rest/api/storageservices/constructing-a-service-sas#constructing-the-signature-string
     if (version >= "2018-11-09") {
         if (sharedKeyCredential !== undefined) {
-            return generateBlobSASQueryParameters20181109(blobSASSignatureValues, sharedKeyCredential);
+            // Version 2020-02-10 delegation SAS signature construction supports blob name as a virtual directory.
+            if (version >= "2020-02-10") {
+                return generateBlobSASQueryParameters20200210(blobSASSignatureValues, sharedKeyCredential);
+            }
+            else {
+                return generateBlobSASQueryParameters20181109(blobSASSignatureValues, sharedKeyCredential);
+            }
         }
         else {
             // Version 2020-02-10 delegation SAS signature construction includes preauthorizedAgentObjectId, agentObjectId, correlationId.
@@ -83408,6 +83308,85 @@ function generateBlobSASQueryParameters20181109(blobSASSignatureValues, sharedKe
 }
 /**
  * ONLY AVAILABLE IN NODE.JS RUNTIME.
+ * IMPLEMENTATION FOR API VERSION FROM 2020-02-10.
+ *
+ * Creates an instance of SASQueryParameters.
+ *
+ * Only accepts required settings needed to create a SAS. For optional settings please
+ * set corresponding properties directly, such as permissions, startsOn and identifier.
+ *
+ * WARNING: When identifier is not provided, permissions and expiresOn are required.
+ * You MUST assign value to identifier or expiresOn & permissions manually if you initial with
+ * this constructor.
+ *
+ * @param blobSASSignatureValues -
+ * @param sharedKeyCredential -
+ */
+function generateBlobSASQueryParameters20200210(blobSASSignatureValues, sharedKeyCredential) {
+    blobSASSignatureValues = SASSignatureValuesSanityCheckAndAutofill(blobSASSignatureValues);
+    if (!blobSASSignatureValues.identifier &&
+        !(blobSASSignatureValues.permissions && blobSASSignatureValues.expiresOn)) {
+        throw new RangeError("Must provide 'permissions' and 'expiresOn' for Blob SAS generation when 'identifier' is not provided.");
+    }
+    let resource = "c";
+    let timestamp = blobSASSignatureValues.snapshotTime;
+    let directoryDepth = undefined;
+    if (blobSASSignatureValues.blobName) {
+        if (blobSASSignatureValues.isDirectory === true) {
+            resource = "d";
+            directoryDepth = trimBlobName(blobSASSignatureValues.blobName).split("/").length;
+        }
+        else {
+            resource = "b";
+            if (blobSASSignatureValues.snapshotTime) {
+                resource = "bs";
+            }
+            else if (blobSASSignatureValues.versionId) {
+                resource = "bv";
+                timestamp = blobSASSignatureValues.versionId;
+            }
+        }
+    }
+    // Calling parse and toString guarantees the proper ordering and throws on invalid characters.
+    let verifiedPermissions;
+    if (blobSASSignatureValues.permissions) {
+        if (blobSASSignatureValues.blobName) {
+            verifiedPermissions = BlobSASPermissions.parse(blobSASSignatureValues.permissions.toString()).toString();
+        }
+        else {
+            verifiedPermissions = ContainerSASPermissions.parse(blobSASSignatureValues.permissions.toString()).toString();
+        }
+    }
+    // Signature is generated on the un-url-encoded values.
+    const stringToSign = [
+        verifiedPermissions ? verifiedPermissions : "",
+        blobSASSignatureValues.startsOn
+            ? utils_common_truncatedISO8061Date(blobSASSignatureValues.startsOn, false)
+            : "",
+        blobSASSignatureValues.expiresOn
+            ? utils_common_truncatedISO8061Date(blobSASSignatureValues.expiresOn, false)
+            : "",
+        getCanonicalName(sharedKeyCredential.accountName, blobSASSignatureValues.containerName, blobSASSignatureValues.blobName),
+        blobSASSignatureValues.identifier,
+        blobSASSignatureValues.ipRange ? ipRangeToString(blobSASSignatureValues.ipRange) : "",
+        blobSASSignatureValues.protocol ? blobSASSignatureValues.protocol : "",
+        blobSASSignatureValues.version,
+        resource,
+        timestamp,
+        blobSASSignatureValues.cacheControl ? blobSASSignatureValues.cacheControl : "",
+        blobSASSignatureValues.contentDisposition ? blobSASSignatureValues.contentDisposition : "",
+        blobSASSignatureValues.contentEncoding ? blobSASSignatureValues.contentEncoding : "",
+        blobSASSignatureValues.contentLanguage ? blobSASSignatureValues.contentLanguage : "",
+        blobSASSignatureValues.contentType ? blobSASSignatureValues.contentType : "",
+    ].join("\n");
+    const signature = sharedKeyCredential.computeHMACSHA256(stringToSign);
+    return {
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, undefined, undefined, undefined, undefined, undefined, undefined, undefined, directoryDepth),
+        stringToSign: stringToSign,
+    };
+}
+/**
+ * ONLY AVAILABLE IN NODE.JS RUNTIME.
  * IMPLEMENTATION FOR API VERSION FROM 2020-12-06.
  *
  * Creates an instance of SASQueryParameters.
@@ -83430,14 +83409,21 @@ function generateBlobSASQueryParameters20201206(blobSASSignatureValues, sharedKe
     }
     let resource = "c";
     let timestamp = blobSASSignatureValues.snapshotTime;
+    let directoryDepth = undefined;
     if (blobSASSignatureValues.blobName) {
-        resource = "b";
-        if (blobSASSignatureValues.snapshotTime) {
-            resource = "bs";
+        if (blobSASSignatureValues.isDirectory === true) {
+            resource = "d";
+            directoryDepth = trimBlobName(blobSASSignatureValues.blobName).split("/").length;
         }
-        else if (blobSASSignatureValues.versionId) {
-            resource = "bv";
-            timestamp = blobSASSignatureValues.versionId;
+        else {
+            resource = "b";
+            if (blobSASSignatureValues.snapshotTime) {
+                resource = "bs";
+            }
+            else if (blobSASSignatureValues.versionId) {
+                resource = "bv";
+                timestamp = blobSASSignatureValues.versionId;
+            }
         }
     }
     // Calling parse and toString guarantees the proper ordering and throws on invalid characters.
@@ -83475,7 +83461,7 @@ function generateBlobSASQueryParameters20201206(blobSASSignatureValues, sharedKe
     ].join("\n");
     const signature = sharedKeyCredential.computeHMACSHA256(stringToSign);
     return {
-        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, undefined, undefined, undefined, blobSASSignatureValues.encryptionScope),
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, undefined, undefined, undefined, blobSASSignatureValues.encryptionScope, undefined, undefined, undefined, directoryDepth),
         stringToSign: stringToSign,
     };
 }
@@ -83580,14 +83566,21 @@ function generateBlobSASQueryParametersUDK20200210(blobSASSignatureValues, userD
     }
     let resource = "c";
     let timestamp = blobSASSignatureValues.snapshotTime;
+    let directoryDepth = undefined;
     if (blobSASSignatureValues.blobName) {
-        resource = "b";
-        if (blobSASSignatureValues.snapshotTime) {
-            resource = "bs";
+        if (blobSASSignatureValues.isDirectory === true) {
+            resource = "d";
+            directoryDepth = trimBlobName(blobSASSignatureValues.blobName).split("/").length;
         }
-        else if (blobSASSignatureValues.versionId) {
-            resource = "bv";
-            timestamp = blobSASSignatureValues.versionId;
+        else {
+            resource = "b";
+            if (blobSASSignatureValues.snapshotTime) {
+                resource = "bs";
+            }
+            else if (blobSASSignatureValues.versionId) {
+                resource = "bv";
+                timestamp = blobSASSignatureValues.versionId;
+            }
         }
     }
     // Calling parse and toString guarantees the proper ordering and throws on invalid characters.
@@ -83636,7 +83629,7 @@ function generateBlobSASQueryParametersUDK20200210(blobSASSignatureValues, userD
     ].join("\n");
     const signature = userDelegationKeyCredential.computeHMACSHA256(stringToSign);
     return {
-        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId),
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId, undefined, undefined, undefined, undefined, directoryDepth),
         stringToSign: stringToSign,
     };
 }
@@ -83662,14 +83655,21 @@ function generateBlobSASQueryParametersUDK20201206(blobSASSignatureValues, userD
     }
     let resource = "c";
     let timestamp = blobSASSignatureValues.snapshotTime;
+    let directoryDepth = undefined;
     if (blobSASSignatureValues.blobName) {
-        resource = "b";
-        if (blobSASSignatureValues.snapshotTime) {
-            resource = "bs";
+        if (blobSASSignatureValues.isDirectory === true) {
+            resource = "d";
+            directoryDepth = trimBlobName(blobSASSignatureValues.blobName).split("/").length;
         }
-        else if (blobSASSignatureValues.versionId) {
-            resource = "bv";
-            timestamp = blobSASSignatureValues.versionId;
+        else {
+            resource = "b";
+            if (blobSASSignatureValues.snapshotTime) {
+                resource = "bs";
+            }
+            else if (blobSASSignatureValues.versionId) {
+                resource = "bv";
+                timestamp = blobSASSignatureValues.versionId;
+            }
         }
     }
     // Calling parse and toString guarantees the proper ordering and throws on invalid characters.
@@ -83719,7 +83719,7 @@ function generateBlobSASQueryParametersUDK20201206(blobSASSignatureValues, userD
     ].join("\n");
     const signature = userDelegationKeyCredential.computeHMACSHA256(stringToSign);
     return {
-        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId, blobSASSignatureValues.encryptionScope),
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId, blobSASSignatureValues.encryptionScope, undefined, undefined, undefined, directoryDepth),
         stringToSign: stringToSign,
     };
 }
@@ -83745,14 +83745,21 @@ function generateBlobSASQueryParametersUDK20250705(blobSASSignatureValues, userD
     }
     let resource = "c";
     let timestamp = blobSASSignatureValues.snapshotTime;
+    let directoryDepth = undefined;
     if (blobSASSignatureValues.blobName) {
-        resource = "b";
-        if (blobSASSignatureValues.snapshotTime) {
-            resource = "bs";
+        if (blobSASSignatureValues.isDirectory === true) {
+            resource = "d";
+            directoryDepth = trimBlobName(blobSASSignatureValues.blobName).split("/").length;
         }
-        else if (blobSASSignatureValues.versionId) {
-            resource = "bv";
-            timestamp = blobSASSignatureValues.versionId;
+        else {
+            resource = "b";
+            if (blobSASSignatureValues.snapshotTime) {
+                resource = "bs";
+            }
+            else if (blobSASSignatureValues.versionId) {
+                resource = "bv";
+                timestamp = blobSASSignatureValues.versionId;
+            }
         }
     }
     // Calling parse and toString guarantees the proper ordering and throws on invalid characters.
@@ -83804,7 +83811,7 @@ function generateBlobSASQueryParametersUDK20250705(blobSASSignatureValues, userD
     ].join("\n");
     const signature = userDelegationKeyCredential.computeHMACSHA256(stringToSign);
     return {
-        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId, blobSASSignatureValues.encryptionScope, blobSASSignatureValues.delegatedUserObjectId),
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId, blobSASSignatureValues.encryptionScope, blobSASSignatureValues.delegatedUserObjectId, undefined, undefined, directoryDepth),
         stringToSign: stringToSign,
     };
 }
@@ -83830,14 +83837,21 @@ function generateBlobSASQueryParametersUDK20260406(blobSASSignatureValues, userD
     }
     let resource = "c";
     let timestamp = blobSASSignatureValues.snapshotTime;
+    let directoryDepth = undefined;
     if (blobSASSignatureValues.blobName) {
-        resource = "b";
-        if (blobSASSignatureValues.snapshotTime) {
-            resource = "bs";
+        if (blobSASSignatureValues.isDirectory === true) {
+            resource = "d";
+            directoryDepth = trimBlobName(blobSASSignatureValues.blobName).split("/").length;
         }
-        else if (blobSASSignatureValues.versionId) {
-            resource = "bv";
-            timestamp = blobSASSignatureValues.versionId;
+        else {
+            resource = "b";
+            if (blobSASSignatureValues.snapshotTime) {
+                resource = "bs";
+            }
+            else if (blobSASSignatureValues.versionId) {
+                resource = "bv";
+                timestamp = blobSASSignatureValues.versionId;
+            }
         }
     }
     // Calling parse and toString guarantees the proper ordering and throws on invalid characters.
@@ -83891,7 +83905,7 @@ function generateBlobSASQueryParametersUDK20260406(blobSASSignatureValues, userD
     ].join("\n");
     const signature = userDelegationKeyCredential.computeHMACSHA256(stringToSign);
     return {
-        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId, blobSASSignatureValues.encryptionScope, blobSASSignatureValues.delegatedUserObjectId, getKeysOfRequestHeaders(blobSASSignatureValues.requestHeaders), getKeysOfRequestHeaders(blobSASSignatureValues.requestQueryParameters)),
+        sasQueryParameters: new SASQueryParameters(blobSASSignatureValues.version, signature, verifiedPermissions, undefined, undefined, blobSASSignatureValues.protocol, blobSASSignatureValues.startsOn, blobSASSignatureValues.expiresOn, blobSASSignatureValues.ipRange, blobSASSignatureValues.identifier, resource, blobSASSignatureValues.cacheControl, blobSASSignatureValues.contentDisposition, blobSASSignatureValues.contentEncoding, blobSASSignatureValues.contentLanguage, blobSASSignatureValues.contentType, userDelegationKeyCredential.userDelegationKey, blobSASSignatureValues.preauthorizedAgentObjectId, blobSASSignatureValues.correlationId, blobSASSignatureValues.encryptionScope, blobSASSignatureValues.delegatedUserObjectId, getKeysOfRequestHeaders(blobSASSignatureValues.requestHeaders), getKeysOfRequestHeaders(blobSASSignatureValues.requestQueryParameters), directoryDepth),
         stringToSign: stringToSign,
     };
 }
@@ -83998,6 +84012,16 @@ function SASSignatureValuesSanityCheckAndAutofill(blobSASSignatureValues) {
     }
     blobSASSignatureValues.version = version;
     return blobSASSignatureValues;
+}
+function trimBlobName(blobName) {
+    let internalName = blobName;
+    while (internalName.startsWith("/")) {
+        internalName = internalName.substring(1);
+    }
+    while (internalName.endsWith("/")) {
+        internalName = internalName.substring(0, internalName.length - 1);
+    }
+    return internalName;
 }
 //# sourceMappingURL=BlobSASSignatureValues.js.map
 ;// CONCATENATED MODULE: ./node_modules/@azure/storage-blob/dist/esm/BlobLeaseClient.js
@@ -87853,6 +87877,7 @@ class BlobClient extends StorageClient_StorageClient {
      * ```ts snippet:ReadmeSampleDownloadBlob_Node
      * import { BlobServiceClient } from "@azure/storage-blob";
      * import { DefaultAzureCredential } from "@azure/identity";
+     * import { buffer } from "node:stream/consumers";
      *
      * const account = "<account>";
      * const blobServiceClient = new BlobServiceClient(
@@ -87869,22 +87894,10 @@ class BlobClient extends StorageClient_StorageClient {
      * // In Node.js, get downloaded data by accessing downloadBlockBlobResponse.readableStreamBody
      * const downloadBlockBlobResponse = await blobClient.download();
      * if (downloadBlockBlobResponse.readableStreamBody) {
-     *   const downloaded = await streamToString(downloadBlockBlobResponse.readableStreamBody);
-     *   console.log(`Downloaded blob content: ${downloaded}`);
-     * }
-     *
-     * async function streamToString(stream: NodeJS.ReadableStream): Promise<string> {
-     *   const result = await new Promise<Buffer<ArrayBuffer>>((resolve, reject) => {
-     *     const chunks: Buffer[] = [];
-     *     stream.on("data", (data) => {
-     *       chunks.push(Buffer.isBuffer(data) ? data : Buffer.from(data));
-     *     });
-     *     stream.on("end", () => {
-     *       resolve(Buffer.concat(chunks));
-     *     });
-     *     stream.on("error", reject);
-     *   });
-     *   return result.toString();
+     *   // Download the raw bytes of the blob. Use `text` from "node:stream/consumers"
+     *   // instead if you want to read the content as a string directly.
+     *   const downloaded = await buffer(downloadBlockBlobResponse.readableStreamBody);
+     *   console.log(`Downloaded blob content: ${downloaded.toString()}`);
      * }
      * ```
      *
@@ -89256,6 +89269,7 @@ class Clients_BlockBlobClient extends BlobClient {
      * ```ts snippet:ClientsQuery
      * import { BlobServiceClient } from "@azure/storage-blob";
      * import { DefaultAzureCredential } from "@azure/identity";
+     * import { buffer } from "node:stream/consumers";
      *
      * const account = "<account>";
      * const blobServiceClient = new BlobServiceClient(
@@ -89271,22 +89285,10 @@ class Clients_BlockBlobClient extends BlobClient {
      * // Query and convert a blob to a string
      * const queryBlockBlobResponse = await blockBlobClient.query("select from BlobStorage");
      * if (queryBlockBlobResponse.readableStreamBody) {
-     *   const downloadedBuffer = await streamToBuffer(queryBlockBlobResponse.readableStreamBody);
-     *   const downloaded = downloadedBuffer.toString();
-     *   console.log(`Query blob content: ${downloaded}`);
-     * }
-     *
-     * async function streamToBuffer(readableStream: NodeJS.ReadableStream): Promise<Buffer> {
-     *   return new Promise((resolve, reject) => {
-     *     const chunks: Buffer[] = [];
-     *     readableStream.on("data", (data) => {
-     *       chunks.push(data instanceof Buffer ? data : Buffer.from(data));
-     *     });
-     *     readableStream.on("end", () => {
-     *       resolve(Buffer.concat(chunks));
-     *     });
-     *     readableStream.on("error", reject);
-     *   });
+     *   // Read the response bytes. Use `text` from "node:stream/consumers" instead
+     *   // if you want the response as a string directly.
+     *   const downloadedBuffer = await buffer(queryBlockBlobResponse.readableStreamBody);
+     *   console.log(`Query blob content: ${downloadedBuffer.toString()}`);
      * }
      * ```
      *
